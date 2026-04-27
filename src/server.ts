@@ -15,7 +15,7 @@ mongoose.set('bufferCommands', false);
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'kcwebsite-rho.vercel.app';
 const NKWA_BASE_URL = process.env.NKWA_BASE_URL || 'https://api.mynkwa.com';
 const NKWA_API_KEY = process.env.NKWA_API_KEY || '';
 const APP_BASE_URL = process.env.APP_BASE_URL || CORS_ORIGIN;
@@ -68,6 +68,7 @@ app.use(cors({
     if (!origin) return callback(null, true);
     const allowedOrigins = [
       CORS_ORIGIN,
+      'https://kcwebsite-rho.vercel.app',
       'http://localhost:5173',
       'http://localhost:3000',
       'https://localhost:5173',
