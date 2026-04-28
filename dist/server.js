@@ -2,25 +2,32 @@ import express from 'express';
 import cors from 'cors';
 import axios from 'axios';
 import dotenv from 'dotenv';
-import { randomBytes, randomUUID, scryptSync, timingSafeEqual, createHash, createHmac } from 'crypto';
+import { randomBytes, randomInt, randomUUID, scryptSync, timingSafeEqual, createHash, createHmac } from 'crypto';
 import mongoose, { Schema, model } from 'mongoose';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import morgan from 'morgan';
+import nodemailer from 'nodemailer';
 import validator from 'validator';
 import { body, validationResult } from 'express-validator';
 dotenv.config();
 mongoose.set('bufferCommands', false);
 const app = express();
+app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT || 8080);
-const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://kcwebsite-rho.vercel.app';
 const NKWA_BASE_URL = process.env.NKWA_BASE_URL || 'https://api.mynkwa.com';
 const NKWA_API_KEY = process.env.NKWA_API_KEY || '';
 const APP_BASE_URL = process.env.APP_BASE_URL || CORS_ORIGIN;
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || `http://localhost:${PORT}`;
 const APP_AUTH_SECRET = process.env.APP_AUTH_SECRET || 'dev-only-secret-change-in-prod';
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+const SMTP_HOST = process.env.SMTP_HOST || '';
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASS = process.env.SMTP_PASS || '';
+const SMTP_FROM_EMAIL = process.env.SMTP_FROM_EMAIL || SMTP_USER;
+const SMTP_FROM_NAME = process.env.SMTP_FROM_NAME || 'Knowledge Center';
 const ADMIN_EMAIL_ALLOWLIST = (process.env.ADMIN_EMAIL_ALLOWLIST || '')
     .split(',')
     .map((x) => x.trim().toLowerCase())
@@ -63,6 +70,7 @@ app.use(cors({
             return callback(null, true);
         const allowedOrigins = [
             CORS_ORIGIN,
+            'https://kcwebsite-rho.vercel.app',
             'http://localhost:5173',
             'http://localhost:3000',
             'https://localhost:5173',
@@ -262,9 +270,20 @@ const UserSchema = new Schema({
     created_at: { type: Date, default: Date.now },
 });
 const User = model('User', UserSchema);
+const PendingUserSchema = new Schema({
+    name: { type: String, required: true },
+    email: { type: String, required: true, unique: true, index: true, lowercase: true },
+    passwordHash: { type: String, required: true },
+    role: { type: String, enum: ['student', 'admin'], default: 'student' },
+    verificationCodeHash: { type: String, required: true },
+    verificationCodeExpiresAt: { type: Date, required: true, index: true },
+    created_at: { type: Date, default: Date.now },
+    updated_at: { type: Date, default: Date.now },
+});
+const PendingUser = model('PendingUser', PendingUserSchema);
 const AuthTokenSchema = new Schema({
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    type: { type: String, enum: ['verify_email', 'reset_password'], required: true, index: true },
+    type: { type: String, enum: ['reset_password'], required: true, index: true },
     tokenHash: { type: String, required: true, index: true },
     expiresAt: { type: Date, required: true, index: true },
     usedAt: { type: Date, default: null },
@@ -359,31 +378,31 @@ function requireDatabase(_req, res, next) {
 function countWords(value) {
     return value.trim().split(/\s+/).filter(Boolean).length;
 }
+function createVerificationCode() {
+    return String(randomInt(100000, 1000000));
+}
 async function sendEmail(to, subject, html, type, userId, meta) {
     const log = await EmailLog.create({ userId, email: to, type, status: 'queued', meta });
-    if (!RESEND_API_KEY) {
-        await EmailLog.updateOne({ _id: log._id }, { status: 'failed', error: 'RESEND_API_KEY missing' });
+    if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !SMTP_FROM_EMAIL) {
+        await EmailLog.updateOne({ _id: log._id }, { status: 'failed', error: 'SMTP configuration missing' });
         return false;
     }
     try {
-        const resp = await fetch('https://api.resend.com/emails', {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${RESEND_API_KEY}`,
-                'Content-Type': 'application/json',
+        const transporter = nodemailer.createTransport({
+            host: SMTP_HOST,
+            port: SMTP_PORT,
+            secure: SMTP_SECURE,
+            auth: {
+                user: SMTP_USER,
+                pass: SMTP_PASS,
             },
-            body: JSON.stringify({
-                from: RESEND_FROM_EMAIL,
-                to: [to],
-                subject,
-                html,
-            }),
         });
-        if (!resp.ok) {
-            const text = await resp.text();
-            await EmailLog.updateOne({ _id: log._id }, { status: 'failed', error: text.slice(0, 500) });
-            return false;
-        }
+        await transporter.sendMail({
+            from: SMTP_FROM_NAME ? `"${SMTP_FROM_NAME}" <${SMTP_FROM_EMAIL}>` : SMTP_FROM_EMAIL,
+            to,
+            subject,
+            html,
+        });
         await EmailLog.updateOne({ _id: log._id }, { status: 'sent' });
         return true;
     }
@@ -595,55 +614,113 @@ app.post('/api/auth/register', async (req, res) => {
         if (existing)
             return res.status(409).json({ error: 'Email already exists' });
         const role = ADMIN_EMAIL_ALLOWLIST.includes(email) ? 'admin' : 'student';
-        const user = await User.create({
-            name: validator.escape(name),
-            email,
-            passwordHash: passwordHash(password),
-            role,
-            isEmailVerified: false,
-            created_at: new Date(),
-        });
-        const rawToken = `${randomUUID()}${randomBytes(12).toString('hex')}`;
-        await AuthToken.create({
-            userId: user._id,
-            type: 'verify_email',
-            tokenHash: makeTokenHash(rawToken),
-            expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24),
-            created_at: new Date(),
-        });
-        const verifyLink = `${APP_BASE_URL}/gsp?verifyToken=${encodeURIComponent(rawToken)}`;
-        await sendEmail(email, 'Verify your KC GSP account', `<p>Hello ${validator.escape(name)},</p><p>Verify your email to activate your KC GSP portal account.</p><p><a href="${verifyLink}">Verify email</a></p><p>This link expires in 24 hours.</p>`, 'auth_verify_email', String(user._id), { verifyLink });
+        const verificationCode = createVerificationCode();
+        const verificationCodeHash = makeTokenHash(`${email}:${verificationCode}`);
+        const expiresAt = new Date(Date.now() + 1000 * 60 * 10);
+        await PendingUser.findOneAndUpdate({ email }, {
+            $set: {
+                name: validator.escape(name),
+                email,
+                passwordHash: passwordHash(password),
+                role,
+                verificationCodeHash,
+                verificationCodeExpiresAt: expiresAt,
+                updated_at: new Date(),
+            },
+            $setOnInsert: {
+                created_at: new Date(),
+            },
+        }, { upsert: true, new: true });
+        await sendEmail(email, 'Your KC GSP verification code', `<p>Hello ${validator.escape(name)},</p><p>Use this verification code to complete your Knowledge Center Global Scholars Programme account setup:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;">${verificationCode}</p><p>This code expires in 10 minutes.</p>`, 'auth_verification_code', undefined, { email });
         return res.status(201).json({
             success: true,
-            message: 'Account created. Please verify your email.',
-            ...(process.env.NODE_ENV !== 'production' ? { debugVerifyToken: rawToken } : {}),
+            requiresVerification: true,
+            email,
+            message: 'Verification code sent. Your account will be created after verification.',
+            ...(process.env.NODE_ENV !== 'production' ? { debugVerificationCode: verificationCode } : {}),
         });
     }
     catch (error) {
         console.error('register error', error);
-        return res.status(500).json({ error: 'Failed to create account' });
+        return res.status(500).json({ error: 'Failed to start account verification' });
     }
 });
 app.post('/api/auth/verify-email', async (req, res) => {
     try {
-        const token = String(req.body?.token || '');
-        if (!token)
-            return res.status(400).json({ error: 'Token is required' });
-        const tokenDoc = await AuthToken.findOne({
-            tokenHash: makeTokenHash(token),
-            type: 'verify_email',
-            usedAt: null,
-            expiresAt: { $gt: new Date() },
+        const email = String(req.body?.email || '').toLowerCase().trim();
+        const code = String(req.body?.code || '').trim();
+        if (!validator.isEmail(email) || !/^\d{6}$/.test(code)) {
+            return res.status(400).json({ error: 'Valid email and 6-digit code are required' });
+        }
+        const pendingUser = await PendingUser.findOne({ email });
+        if (!pendingUser)
+            return res.status(404).json({ error: 'No pending verification found for this email' });
+        if (pendingUser.verificationCodeExpiresAt <= new Date()) {
+            return res.status(400).json({ error: 'Verification code has expired. Request a new code.' });
+        }
+        if (pendingUser.verificationCodeHash !== makeTokenHash(`${email}:${code}`)) {
+            return res.status(400).json({ error: 'Verification code is invalid' });
+        }
+        const existingUser = await User.findOne({ email });
+        if (existingUser) {
+            await PendingUser.deleteOne({ _id: pendingUser._id });
+            return res.status(409).json({ error: 'Email already exists' });
+        }
+        const user = await User.create({
+            name: pendingUser.name,
+            email: pendingUser.email,
+            passwordHash: pendingUser.passwordHash,
+            role: pendingUser.role,
+            isEmailVerified: true,
+            lastLoginAt: new Date(),
+            created_at: new Date(),
         });
-        if (!tokenDoc)
-            return res.status(400).json({ error: 'Token is invalid or expired' });
-        await User.updateOne({ _id: tokenDoc.userId }, { isEmailVerified: true });
-        await AuthToken.updateOne({ _id: tokenDoc._id }, { usedAt: new Date() });
-        return res.json({ success: true, message: 'Email verified successfully' });
+        await PendingUser.deleteOne({ _id: pendingUser._id });
+        const token = createSessionToken({ userId: String(user._id), role: user.role, email: user.email });
+        return res.json({
+            success: true,
+            message: 'Email verified successfully',
+            token,
+            user: {
+                id: String(user._id),
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                isEmailVerified: user.isEmailVerified,
+            },
+        });
     }
     catch (error) {
         console.error('verify email error', error);
         return res.status(500).json({ error: 'Failed to verify email' });
+    }
+});
+app.post('/api/auth/resend-verification-code', async (req, res) => {
+    try {
+        const email = String(req.body?.email || '').toLowerCase().trim();
+        if (!validator.isEmail(email))
+            return res.status(400).json({ error: 'Valid email required' });
+        const pendingUser = await PendingUser.findOne({ email });
+        if (!pendingUser)
+            return res.status(404).json({ error: 'No pending verification found for this email' });
+        const verificationCode = createVerificationCode();
+        const verificationCodeHash = makeTokenHash(`${email}:${verificationCode}`);
+        const expiresAt = new Date(Date.now() + 1000 * 60 * 10);
+        await PendingUser.updateOne({ _id: pendingUser._id }, {
+            verificationCodeHash,
+            verificationCodeExpiresAt: expiresAt,
+            updated_at: new Date(),
+        });
+        await sendEmail(pendingUser.email, 'Your KC GSP verification code', `<p>Hello ${validator.escape(pendingUser.name)},</p><p>Use this verification code to complete your Knowledge Center Global Scholars Programme account setup:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;">${verificationCode}</p><p>This code expires in 10 minutes.</p>`, 'auth_verification_code_resend', undefined, { email: pendingUser.email });
+        return res.json({
+            success: true,
+            message: 'A new verification code has been sent.',
+            ...(process.env.NODE_ENV !== 'production' ? { debugVerificationCode: verificationCode } : {}),
+        });
+    }
+    catch (error) {
+        console.error('resend verification code error', error);
+        return res.status(500).json({ error: 'Failed to resend verification code' });
     }
 });
 app.post('/api/auth/login', async (req, res) => {
@@ -653,7 +730,14 @@ app.post('/api/auth/login', async (req, res) => {
         if (!validator.isEmail(email) || !password)
             return res.status(400).json({ error: 'Email and password are required' });
         const user = await User.findOne({ email });
-        if (!user || !verifyPassword(password, user.passwordHash))
+        if (!user) {
+            const pendingUser = await PendingUser.findOne({ email });
+            if (pendingUser) {
+                return res.status(403).json({ error: 'Finish email verification to create your account and sign in' });
+            }
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        if (!verifyPassword(password, user.passwordHash))
             return res.status(401).json({ error: 'Invalid credentials' });
         if (!user.isEmailVerified)
             return res.status(403).json({ error: 'Please verify your email before login' });
