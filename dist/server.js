@@ -7,7 +7,8 @@ import mongoose, { Schema, model } from 'mongoose';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import nodemailer from 'nodemailer';
+import { clerkMiddleware, createClerkClient, getAuth } from '@clerk/express';
+import { Resend } from 'resend';
 import validator from 'validator';
 import { body, validationResult } from 'express-validator';
 dotenv.config();
@@ -21,13 +22,9 @@ const NKWA_API_KEY = process.env.NKWA_API_KEY || '';
 const APP_BASE_URL = process.env.APP_BASE_URL || CORS_ORIGIN;
 const BACKEND_PUBLIC_URL = process.env.BACKEND_PUBLIC_URL || `http://localhost:${PORT}`;
 const APP_AUTH_SECRET = process.env.APP_AUTH_SECRET || 'dev-only-secret-change-in-prod';
-const SMTP_HOST = process.env.SMTP_HOST || '';
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_SECURE = String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
-const SMTP_USER = process.env.SMTP_USER || '';
-const SMTP_PASS = process.env.SMTP_PASS || '';
-const SMTP_FROM_EMAIL = process.env.SMTP_FROM_EMAIL || SMTP_USER;
-const SMTP_FROM_NAME = process.env.SMTP_FROM_NAME || 'Knowledge Center';
+const resend = new Resend(process.env.RESEND_API_KEY || '');
+const EMAIL_FROM = process.env.EMAIL_FROM || 'Knowledge Center <onboarding@resend.dev>';
+const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY || '' });
 const ADMIN_EMAIL_ALLOWLIST = (process.env.ADMIN_EMAIL_ALLOWLIST || '')
     .split(',')
     .map((x) => x.trim().toLowerCase())
@@ -59,11 +56,19 @@ const authLimiter = rateLimit({
     max: 10,
     message: { error: 'Too many authentication attempts, please try again later.' },
 });
+const blogCommentLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 3,
+    message: { error: 'Too many comments submitted from this IP. Please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 app.use('/api/', limiter);
 app.use('/api/auth/', authLimiter);
 app.use('/api/stem/register', authLimiter);
 app.use('/api/nkwa/webhook', authLimiter);
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+app.use(clerkMiddleware());
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin)
@@ -234,10 +239,10 @@ const TimelineSchema = new Schema({
 const TimelineItem = model('TimelineItem', TimelineSchema);
 const BlogLikeSchema = new Schema({
     postId: { type: String, required: true, index: true },
-    userId: { type: String, required: true, index: true },
+    browserUuid: { type: String, required: true, index: true },
     created_at: { type: Date, default: Date.now },
 });
-BlogLikeSchema.index({ postId: 1, userId: 1 }, { unique: true });
+BlogLikeSchema.index({ postId: 1, browserUuid: 1 }, { unique: true });
 const BlogLike = model('BlogLike', BlogLikeSchema);
 const BlogCommentSchema = new Schema({
     postId: { type: String, required: true, index: true },
@@ -255,6 +260,9 @@ const BlogCommentSchema = new Schema({
         validate: { validator: (content) => content.trim().length > 0, message: 'Comment content cannot be empty' },
     },
     parentId: { type: String, default: null },
+    guestEmail: { type: String, default: '' },
+    status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+    browserUuid: { type: String, default: '' },
     likes: { type: Number, default: 0 },
     created_at: { type: Date, default: Date.now },
     updated_at: { type: Date },
@@ -300,6 +308,7 @@ const GspApplicationSchema = new Schema({
     submittedAt: { type: Date, default: null },
     decisionStatus: { type: String, enum: ['pending', 'accepted', 'waitlisted', 'not_admitted'], default: 'pending' },
     decisionUpdatedAt: { type: Date, default: null },
+    adminNotes: { type: String, default: '' },
     created_at: { type: Date, default: Date.now },
     updated_at: { type: Date, default: Date.now },
 });
@@ -321,6 +330,31 @@ const EmailLogSchema = new Schema({
     created_at: { type: Date, default: Date.now },
 });
 const EmailLog = model('EmailLog', EmailLogSchema);
+const EmailTemplateSchema = new Schema({
+    type: { type: String, required: true, unique: true, index: true },
+    subject: { type: String, required: true },
+    html: { type: String, required: true },
+    updatedAt: { type: Date, default: Date.now },
+    updatedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+});
+const EmailTemplate = model('EmailTemplate', EmailTemplateSchema);
+const BlogPostSchema = new Schema({
+    title: { type: String, required: true },
+    slug: { type: String, required: true, unique: true, index: true },
+    excerpt: { type: String, default: '' },
+    content: { type: String, required: true },
+    coverImageUrl: { type: String, default: '' },
+    category: { type: String, default: '' },
+    tags: { type: [String], default: [] },
+    status: { type: String, enum: ['draft', 'published'], default: 'draft' },
+    authorId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    authorName: { type: String, required: true },
+    publishedAt: { type: Date, default: null },
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now },
+    viewCount: { type: Number, default: 0 },
+});
+const BlogPost = model('BlogPost', BlogPostSchema);
 function makeTokenHash(raw) {
     return createHash('sha256').update(raw).digest('hex');
 }
@@ -381,27 +415,106 @@ function countWords(value) {
 function createVerificationCode() {
     return String(randomInt(100000, 1000000));
 }
-async function sendEmail(to, subject, html, type, userId, meta) {
+function applyTemplateVars(value, templateVars) {
+    return value
+        .replace(/\{\{name\}\}/g, templateVars?.name ?? '')
+        .replace(/\{\{verificationCode\}\}/g, templateVars?.verificationCode ?? '')
+        .replace(/\{\{resetLink\}\}/g, templateVars?.resetLink ?? '')
+        .replace(/\{\{reference\}\}/g, templateVars?.reference ?? '');
+}
+function sanitizeApplicationForApplicant(application) {
+    if (!application)
+        return application;
+    const plain = typeof application.toObject === 'function' ? application.toObject() : { ...application };
+    delete plain.adminNotes;
+    return plain;
+}
+function escapeCsv(value) {
+    return `"${String(value ?? '').replace(/"/g, '""')}"`;
+}
+function slugifyBlogTitle(title) {
+    return title
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, '')
+        .trim()
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-');
+}
+async function ensureUniqueBlogSlug(baseSlug, excludeId) {
+    const normalizedBase = slugifyBlogTitle(baseSlug) || `post-${Date.now()}`;
+    let candidate = normalizedBase;
+    let suffix = 2;
+    while (true) {
+        const existing = await BlogPost.findOne({
+            slug: candidate,
+            ...(excludeId ? { _id: { $ne: excludeId } } : {}),
+        }).select('_id');
+        if (!existing)
+            return candidate;
+        candidate = `${normalizedBase}-${suffix}`;
+        suffix += 1;
+    }
+}
+function buildAdminApplicationFilter(query, status, decisionStatus, grade, userIds) {
+    const baseFilter = {};
+    if (status)
+        baseFilter.status = status;
+    if (decisionStatus)
+        baseFilter.decisionStatus = decisionStatus;
+    if (grade)
+        baseFilter['data.currentClass'] = grade;
+    if (userIds.length > 0)
+        baseFilter.userId = { $in: userIds };
+    if (query && userIds.length === 0)
+        baseFilter.userId = { $in: [] };
+    return baseFilter;
+}
+async function resolveApplicationUserIds(query) {
+    if (!query)
+        return [];
+    const users = await User.find({
+        $or: [
+            { email: { $regex: query, $options: 'i' } },
+            { name: { $regex: query, $options: 'i' } },
+        ],
+    }).select('_id');
+    return users.map((user) => String(user._id));
+}
+async function resolveBroadcastRecipients(recipients) {
+    if (recipients === 'all_users') {
+        const users = await User.find({}).select('_id email').lean();
+        return users.map((user) => ({ email: user.email, userId: String(user._id) }));
+    }
+    const appFilter = { status: 'submitted' };
+    if (recipients === 'accepted' || recipients === 'waitlisted' || recipients === 'not_admitted') {
+        appFilter.decisionStatus = recipients;
+    }
+    else if (recipients === 'pending_decision') {
+        appFilter.decisionStatus = 'pending';
+    }
+    else if (recipients !== 'submitted_applicants') {
+        return [];
+    }
+    const applications = await GspApplication.find(appFilter).select('userId').lean();
+    const userIds = applications.map((application) => application.userId);
+    const users = await User.find({ _id: { $in: userIds } }).select('_id email').lean();
+    return users.map((user) => ({ email: user.email, userId: String(user._id) }));
+}
+async function sendEmail(to, subject, html, type, userId, meta, templateVars) {
     const log = await EmailLog.create({ userId, email: to, type, status: 'queued', meta });
-    if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !SMTP_FROM_EMAIL) {
-        await EmailLog.updateOne({ _id: log._id }, { status: 'failed', error: 'SMTP configuration missing' });
+    if (!process.env.RESEND_API_KEY) {
+        await EmailLog.updateOne({ _id: log._id }, { status: 'failed', error: 'Resend API key not configured' });
         return false;
     }
     try {
-        const transporter = nodemailer.createTransport({
-            host: SMTP_HOST,
-            port: SMTP_PORT,
-            secure: SMTP_SECURE,
-            auth: {
-                user: SMTP_USER,
-                pass: SMTP_PASS,
-            },
-        });
-        await transporter.sendMail({
-            from: SMTP_FROM_NAME ? `"${SMTP_FROM_NAME}" <${SMTP_FROM_EMAIL}>` : SMTP_FROM_EMAIL,
+        const template = await EmailTemplate.findOne({ type }).lean();
+        const resolvedSubject = applyTemplateVars(template?.subject || subject, templateVars);
+        const resolvedHtml = applyTemplateVars(template?.html || html, templateVars);
+        await resend.emails.send({
+            from: EMAIL_FROM,
             to,
-            subject,
-            html,
+            subject: resolvedSubject,
+            html: resolvedHtml,
         });
         await EmailLog.updateOne({ _id: log._id }, { status: 'sent' });
         return true;
@@ -410,6 +523,36 @@ async function sendEmail(to, subject, html, type, userId, meta) {
         await EmailLog.updateOne({ _id: log._id }, { status: 'failed', error: String(error?.message || error) });
         return false;
     }
+}
+async function seedEmailTemplates() {
+    const templates = [
+        {
+            type: 'auth_verification_code',
+            subject: 'Your KC GSP verification code',
+            html: '<p>Hello {{name}},</p><p>Use this verification code to complete your Knowledge Center Global Scholars Programme account setup:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;">{{verificationCode}}</p><p>This code expires in 10 minutes.</p>',
+        },
+        {
+            type: 'auth_verification_code_resend',
+            subject: 'Your KC GSP verification code',
+            html: '<p>Hello {{name}},</p><p>Use this verification code to complete your Knowledge Center Global Scholars Programme account setup:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;">{{verificationCode}}</p><p>This code expires in 10 minutes.</p>',
+        },
+        {
+            type: 'auth_reset_password',
+            subject: 'Reset your KC GSP password',
+            html: '<p>Hello {{name}},</p><p>Use this link to reset your password.</p><p><a href="{{resetLink}}">Reset password</a></p><p>This link expires in 30 minutes.</p>',
+        },
+        {
+            type: 'gsp_submission_confirmation',
+            subject: 'KC GSP Application Submitted',
+            html: '<p>Hello {{name}},</p><p>Your KC Global Scholars Programme application has been submitted successfully.</p><p><strong>Reference:</strong> {{reference}}</p><p>You can now track your status from your dashboard.</p>',
+        },
+        {
+            type: 'gsp_decision_release',
+            subject: 'KC GSP Decision Update',
+            html: '<p>Hello {{name}},</p><p>Your KC Global Scholars Programme decision is now available in your portal dashboard.</p><p>Please sign in to view your decision.</p>',
+        },
+    ];
+    await Promise.all(templates.map((template) => EmailTemplate.updateOne({ type: template.type }, { $setOnInsert: template }, { upsert: true })));
 }
 async function ensureDecisionConfig() {
     const key = 'gsp-2026';
@@ -631,14 +774,16 @@ app.post('/api/auth/register', async (req, res) => {
                 created_at: new Date(),
             },
         }, { upsert: true, new: true });
-        await sendEmail(email, 'Your KC GSP verification code', `<p>Hello ${validator.escape(name)},</p><p>Use this verification code to complete your Knowledge Center Global Scholars Programme account setup:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;">${verificationCode}</p><p>This code expires in 10 minutes.</p>`, 'auth_verification_code', undefined, { email });
-        return res.status(201).json({
+        const responseBody = {
             success: true,
             requiresVerification: true,
             email,
             message: 'Verification code sent. Your account will be created after verification.',
             ...(process.env.NODE_ENV !== 'production' ? { debugVerificationCode: verificationCode } : {}),
-        });
+        };
+        res.status(201).json(responseBody);
+        sendEmail(email, 'Your KC GSP verification code', `<p>Hello ${validator.escape(name)},</p><p>Use this verification code to complete your Knowledge Center Global Scholars Programme account setup:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;">${verificationCode}</p><p>This code expires in 10 minutes.</p>`, 'auth_verification_code', undefined, { email }, { name: validator.escape(name), verificationCode }).catch(console.error);
+        return;
     }
     catch (error) {
         console.error('register error', error);
@@ -711,12 +856,14 @@ app.post('/api/auth/resend-verification-code', async (req, res) => {
             verificationCodeExpiresAt: expiresAt,
             updated_at: new Date(),
         });
-        await sendEmail(pendingUser.email, 'Your KC GSP verification code', `<p>Hello ${validator.escape(pendingUser.name)},</p><p>Use this verification code to complete your Knowledge Center Global Scholars Programme account setup:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;">${verificationCode}</p><p>This code expires in 10 minutes.</p>`, 'auth_verification_code_resend', undefined, { email: pendingUser.email });
-        return res.json({
+        const responseBody = {
             success: true,
             message: 'A new verification code has been sent.',
             ...(process.env.NODE_ENV !== 'production' ? { debugVerificationCode: verificationCode } : {}),
-        });
+        };
+        res.json(responseBody);
+        sendEmail(pendingUser.email, 'Your KC GSP verification code', `<p>Hello ${validator.escape(pendingUser.name)},</p><p>Use this verification code to complete your Knowledge Center Global Scholars Programme account setup:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px;">${verificationCode}</p><p>This code expires in 10 minutes.</p>`, 'auth_verification_code_resend', undefined, { email: pendingUser.email }, { name: validator.escape(pendingUser.name), verificationCode }).catch(console.error);
+        return;
     }
     catch (error) {
         console.error('resend verification code error', error);
@@ -779,11 +926,13 @@ app.post('/api/auth/forgot-password', async (req, res) => {
             created_at: new Date(),
         });
         const resetLink = `${APP_BASE_URL}/gsp?resetToken=${encodeURIComponent(rawToken)}`;
-        await sendEmail(user.email, 'Reset your KC GSP password', `<p>Hello ${validator.escape(user.name)},</p><p>Use this link to reset your password.</p><p><a href="${resetLink}">Reset password</a></p><p>This link expires in 30 minutes.</p>`, 'auth_reset_password', String(user._id), { resetLink });
-        return res.json({
+        const responseBody = {
             success: true,
             ...(process.env.NODE_ENV !== 'production' ? { debugResetToken: rawToken } : {}),
-        });
+        };
+        res.json(responseBody);
+        sendEmail(user.email, 'Reset your KC GSP password', `<p>Hello ${validator.escape(user.name)},</p><p>Use this link to reset your password.</p><p><a href="${resetLink}">Reset password</a></p><p>This link expires in 30 minutes.</p>`, 'auth_reset_password', String(user._id), { resetLink }, { name: validator.escape(user.name), resetLink }).catch(console.error);
+        return;
     }
     catch (error) {
         console.error('forgot password error', error);
@@ -831,6 +980,55 @@ app.get('/api/auth/me', async (req, res) => {
         },
     });
 });
+app.get('/api/clerk-auth/me', async (req, res) => {
+    try {
+        const { userId: clerkUserId } = getAuth(req);
+        if (!clerkUserId)
+            return res.status(401).json({ error: 'Authentication required' });
+        const clerkUser = await clerkClient.users.getUser(clerkUserId);
+        const primaryEmailAddress = clerkUser.emailAddresses.find((item) => item.id === clerkUser.primaryEmailAddressId)
+            || clerkUser.emailAddresses[0];
+        const email = String(primaryEmailAddress?.emailAddress || '').toLowerCase().trim();
+        if (!validator.isEmail(email))
+            return res.status(400).json({ error: 'Clerk user does not have a valid email address' });
+        let user = await User.findOne({ email });
+        if (!user) {
+            const firstName = String(clerkUser.firstName || '').trim();
+            const lastName = String(clerkUser.lastName || '').trim();
+            const fullName = `${firstName} ${lastName}`.trim() || email.split('@')[0];
+            user = await User.create({
+                name: fullName,
+                email,
+                passwordHash: '',
+                isEmailVerified: true,
+                role: ADMIN_EMAIL_ALLOWLIST.includes(email) ? 'admin' : 'student',
+                lastLoginAt: new Date(),
+                created_at: new Date(),
+            });
+        }
+        else {
+            await User.updateOne({ _id: user._id }, { lastLoginAt: new Date(), isEmailVerified: true });
+            user = await User.findById(user._id);
+        }
+        if (!user)
+            return res.status(404).json({ error: 'User not found' });
+        const token = createSessionToken({ userId: String(user._id), role: user.role, email: user.email });
+        return res.json({
+            token,
+            user: {
+                id: String(user._id),
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                isEmailVerified: user.isEmailVerified,
+            },
+        });
+    }
+    catch (error) {
+        console.error('clerk auth bridge error', error);
+        return res.status(500).json({ error: 'Failed to authenticate Clerk user' });
+    }
+});
 app.get('/api/gsp/application', async (req, res) => {
     const auth = await requireAuth(req, res);
     if (!auth)
@@ -849,7 +1047,7 @@ app.get('/api/gsp/application', async (req, res) => {
             },
         });
     }
-    return res.json({ application: existing });
+    return res.json({ application: sanitizeApplicationForApplicant(existing) });
 });
 app.put('/api/gsp/application/draft', async (req, res) => {
     const auth = await requireAuth(req, res);
@@ -894,10 +1092,12 @@ app.post('/api/gsp/application/submit', async (req, res) => {
         $setOnInsert: { userId: auth.userId, created_at: new Date() },
     }, { upsert: true, new: true });
     const user = await User.findById(auth.userId);
+    const responseBody = { success: true, reference, application: sanitizeApplicationForApplicant(saved) };
+    res.json(responseBody);
     if (user) {
-        await sendEmail(user.email, 'KC GSP Application Submitted', `<p>Hello ${validator.escape(user.name)},</p><p>Your KC Global Scholars Programme application has been submitted successfully.</p><p><strong>Reference:</strong> ${reference}</p><p>You can now track your status from your dashboard.</p>`, 'gsp_submission_confirmation', String(user._id), { reference });
+        sendEmail(user.email, 'KC GSP Application Submitted', `<p>Hello ${validator.escape(user.name)},</p><p>Your KC Global Scholars Programme application has been submitted successfully.</p><p><strong>Reference:</strong> ${reference}</p><p>You can now track your status from your dashboard.</p>`, 'gsp_submission_confirmation', String(user._id), { reference }, { name: validator.escape(user.name), reference }).catch(console.error);
     }
-    return res.json({ success: true, reference, application: saved });
+    return;
 });
 app.get('/api/gsp/application/decision', async (req, res) => {
     const auth = await requireAuth(req, res);
@@ -967,45 +1167,40 @@ app.post('/api/gsp/uploads', async (req, res) => {
     }
 });
 app.get('/api/admin/gsp/applications', async (req, res) => {
-    const auth = await requireAdmin(req, res);
-    if (!auth)
-        return;
-    const query = String(req.query?.query || '').trim();
-    const status = String(req.query?.status || '').trim();
-    const decisionStatus = String(req.query?.decisionStatus || '').trim();
-    const baseFilter = {};
-    if (status)
-        baseFilter.status = status;
-    if (decisionStatus)
-        baseFilter.decisionStatus = decisionStatus;
-    if (query) {
-        const users = await User.find({
-            $or: [
-                { email: { $regex: query, $options: 'i' } },
-                { name: { $regex: query, $options: 'i' } },
-            ],
-        }).select('_id');
-        baseFilter.userId = { $in: users.map((u) => u._id) };
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const query = String(req.query?.query || '').trim();
+        const status = String(req.query?.status || '').trim();
+        const decisionStatus = String(req.query?.decisionStatus || '').trim();
+        const grade = String(req.query?.grade || '').trim();
+        const matchedUserIds = await resolveApplicationUserIds(query);
+        const baseFilter = buildAdminApplicationFilter(query, status, decisionStatus, grade, matchedUserIds);
+        const applications = await GspApplication.find(baseFilter).sort({ submittedAt: -1, updated_at: -1 }).lean();
+        const userIds = applications.map((application) => application.userId);
+        const users = await User.find({ _id: { $in: userIds } }).lean();
+        const userMap = new Map(users.map((user) => [String(user._id), user]));
+        const merged = applications.map((application) => ({
+            ...application,
+            user: (() => {
+                const user = userMap.get(String(application.userId));
+                return user ? {
+                    id: String(user._id),
+                    name: user.name,
+                    email: user.email,
+                    role: user.role,
+                    isEmailVerified: user.isEmailVerified,
+                    lastLoginAt: user.lastLoginAt,
+                } : null;
+            })(),
+        }));
+        return res.json({ applications: merged });
     }
-    const applications = await GspApplication.find(baseFilter).sort({ submittedAt: -1, updated_at: -1 }).lean();
-    const userIds = applications.map((a) => a.userId);
-    const users = await User.find({ _id: { $in: userIds } }).lean();
-    const userMap = new Map(users.map((u) => [String(u._id), u]));
-    const merged = applications.map((a) => ({
-        ...a,
-        user: (() => {
-            const user = userMap.get(String(a.userId));
-            return user ? {
-                id: String(user._id),
-                name: user.name,
-                email: user.email,
-                role: user.role,
-                isEmailVerified: user.isEmailVerified,
-                lastLoginAt: user.lastLoginAt,
-            } : null;
-        })(),
-    }));
-    return res.json({ applications: merged });
+    catch (error) {
+        console.error('admin applications list error', error);
+        return res.status(500).json({ error: 'Failed to fetch applications' });
+    }
 });
 app.get('/api/admin/gsp/applications/:id', async (req, res) => {
     const auth = await requireAdmin(req, res);
@@ -1057,7 +1252,7 @@ app.patch('/api/admin/gsp/release', async (req, res) => {
             const user = userMap.get(String(appRec.userId));
             if (!user)
                 continue;
-            await sendEmail(user.email, 'KC GSP Decision Update', `<p>Hello ${validator.escape(user.name)},</p><p>Your KC Global Scholars Programme decision is now available in your portal dashboard.</p><p>Please sign in to view your decision.</p>`, 'gsp_decision_release', String(user._id), { applicationId: String(appRec._id), decisionStatus: appRec.decisionStatus });
+            await sendEmail(user.email, 'KC GSP Decision Update', `<p>Hello ${validator.escape(user.name)},</p><p>Your KC Global Scholars Programme decision is now available in your portal dashboard.</p><p>Please sign in to view your decision.</p>`, 'gsp_decision_release', String(user._id), { applicationId: String(appRec._id), decisionStatus: appRec.decisionStatus }, { name: validator.escape(user.name) });
         }
     }
     return res.json({ success: true, release: updated });
@@ -1085,6 +1280,212 @@ app.get('/api/admin/gsp/users', async (req, res) => {
             createdAt: user.created_at,
         })),
     });
+});
+app.get('/api/admin/stats', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const [totalUsers, submittedApplications, draftApplications, decisionBreakdownRaw, totalBlogPosts, pendingComments] = await Promise.all([
+            User.countDocuments(),
+            GspApplication.countDocuments({ status: 'submitted' }),
+            GspApplication.countDocuments({ status: 'draft' }),
+            GspApplication.aggregate([
+                { $match: { status: 'submitted' } },
+                { $group: { _id: '$decisionStatus', count: { $sum: 1 } } },
+            ]),
+            BlogPost.countDocuments(),
+            BlogComment.countDocuments({ status: 'pending' }),
+        ]);
+        const decisionBreakdown = {
+            pending: 0,
+            accepted: 0,
+            waitlisted: 0,
+            not_admitted: 0,
+        };
+        for (const item of decisionBreakdownRaw) {
+            if (item?._id && item._id in decisionBreakdown) {
+                decisionBreakdown[item._id] = item.count;
+            }
+        }
+        return res.json({
+            totalUsers,
+            submittedApplications,
+            draftApplications,
+            decisionBreakdown,
+            totalBlogPosts,
+            pendingComments,
+        });
+    }
+    catch (error) {
+        console.error('admin stats error', error);
+        return res.status(500).json({ error: 'Failed to fetch admin stats' });
+    }
+});
+app.patch('/api/admin/gsp/applications/:id/notes', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const notes = String(req.body?.notes || '');
+        const updated = await GspApplication.findByIdAndUpdate(req.params.id, { adminNotes: notes, updated_at: new Date() }, { new: true });
+        if (!updated)
+            return res.status(404).json({ error: 'Application not found' });
+        return res.json({ success: true });
+    }
+    catch (error) {
+        console.error('admin notes update error', error);
+        return res.status(500).json({ error: 'Failed to update admin notes' });
+    }
+});
+app.patch('/api/admin/gsp/applications/bulk-decision', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((id) => String(id)).filter(Boolean) : [];
+        const decisionStatus = String(req.body?.decisionStatus || '');
+        if (ids.length === 0)
+            return res.status(400).json({ error: 'ids must be a non-empty array' });
+        if (!['pending', 'accepted', 'waitlisted', 'not_admitted'].includes(decisionStatus)) {
+            return res.status(400).json({ error: 'Invalid decision status' });
+        }
+        const result = await GspApplication.updateMany({ _id: { $in: ids } }, { decisionStatus, decisionUpdatedAt: new Date(), updated_at: new Date() });
+        return res.json({ updated: result.modifiedCount });
+    }
+    catch (error) {
+        console.error('bulk decision error', error);
+        return res.status(500).json({ error: 'Failed to update applications' });
+    }
+});
+app.get('/api/admin/gsp/applications/export', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const query = String(req.query?.query || '').trim();
+        const status = String(req.query?.status || '').trim();
+        const decisionStatus = String(req.query?.decisionStatus || '').trim();
+        const grade = String(req.query?.grade || '').trim();
+        const matchedUserIds = await resolveApplicationUserIds(query);
+        const baseFilter = buildAdminApplicationFilter(query, status, decisionStatus, grade, matchedUserIds);
+        const applications = await GspApplication.find(baseFilter).sort({ submittedAt: -1, updated_at: -1 }).lean();
+        const users = await User.find({ _id: { $in: applications.map((application) => application.userId) } }).lean();
+        const userMap = new Map(users.map((user) => [String(user._id), user]));
+        const headers = ['Reference', 'First Name', 'Last Name', 'Email', 'Phone', 'School', 'Grade', 'Region', 'Gender', 'Payment Method', 'Decision Status', 'Submitted At'];
+        const rows = applications.map((application) => {
+            const user = userMap.get(String(application.userId));
+            return [
+                application.reference,
+                application.data?.firstName,
+                application.data?.lastName,
+                user?.email || application.data?.email,
+                application.data?.phone,
+                application.data?.schoolName,
+                application.data?.currentClass,
+                application.data?.region,
+                application.data?.gender,
+                application.data?.paymentMethod,
+                application.decisionStatus,
+                application.submittedAt ? new Date(application.submittedAt).toISOString() : '',
+            ].map(escapeCsv).join(',');
+        });
+        const csv = [headers.map(escapeCsv).join(','), ...rows].join('\n');
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="kc-gsp-applications.csv"');
+        return res.send(csv);
+    }
+    catch (error) {
+        console.error('application export error', error);
+        return res.status(500).json({ error: 'Failed to export applications' });
+    }
+});
+app.get('/api/admin/email-templates', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const templates = await EmailTemplate.find({}).sort({ type: 1 }).lean();
+        return res.json({ templates });
+    }
+    catch (error) {
+        console.error('email templates list error', error);
+        return res.status(500).json({ error: 'Failed to fetch email templates' });
+    }
+});
+app.get('/api/admin/email-templates/:type', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const template = await EmailTemplate.findOne({ type: req.params.type }).lean();
+        if (!template)
+            return res.status(404).json({ error: 'Template not found' });
+        return res.json({ template });
+    }
+    catch (error) {
+        console.error('email template fetch error', error);
+        return res.status(500).json({ error: 'Failed to fetch email template' });
+    }
+});
+app.patch('/api/admin/email-templates/:type', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const updates = {
+            updatedAt: new Date(),
+            updatedBy: auth.userId,
+        };
+        if (typeof req.body?.subject === 'string')
+            updates.subject = req.body.subject;
+        if (typeof req.body?.html === 'string')
+            updates.html = req.body.html;
+        const template = await EmailTemplate.findOneAndUpdate({ type: req.params.type }, updates, { new: true });
+        if (!template)
+            return res.status(404).json({ error: 'Template not found' });
+        return res.json({ template });
+    }
+    catch (error) {
+        console.error('email template update error', error);
+        return res.status(500).json({ error: 'Failed to update email template' });
+    }
+});
+app.get('/api/admin/broadcast/count', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const recipients = String(req.query?.recipients || '');
+        const resolvedRecipients = await resolveBroadcastRecipients(recipients);
+        return res.json({ count: resolvedRecipients.length });
+    }
+    catch (error) {
+        console.error('broadcast count error', error);
+        return res.status(500).json({ error: 'Failed to count broadcast recipients' });
+    }
+});
+app.post('/api/admin/broadcast', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const subject = String(req.body?.subject || '').trim();
+        const html = String(req.body?.html || '').trim();
+        const recipients = String(req.body?.recipients || '').trim();
+        if (!subject || !html || !recipients)
+            return res.status(400).json({ error: 'subject, html, and recipients are required' });
+        const resolvedRecipients = await resolveBroadcastRecipients(recipients);
+        res.json({ queued: resolvedRecipients.length });
+        for (const recipient of resolvedRecipients) {
+            sendEmail(recipient.email, subject, html, 'admin_broadcast', recipient.userId).catch(console.error);
+        }
+        return;
+    }
+    catch (error) {
+        console.error('broadcast send error', error);
+        return res.status(500).json({ error: 'Failed to queue broadcast email' });
+    }
 });
 app.post('/api/stem/register', validateRegistration, async (req, res) => {
     try {
@@ -1207,87 +1608,399 @@ app.post('/api/timeline', async (req, res) => {
         return res.status(500).json({ error: 'Failed to add timeline item' });
     }
 });
+app.patch('/api/timeline/:id', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const payload = {
+            title: String(req.body?.title || '').trim(),
+            description: String(req.body?.description || '').trim(),
+            date_iso: new Date(req.body?.dateISO || req.body?.date_iso),
+            tag: String(req.body?.tag || '').trim(),
+            imageUrl: String(req.body?.imageUrl || '').trim(),
+            linkUrl: String(req.body?.linkUrl || '').trim(),
+        };
+        if (!payload.title || Number.isNaN(payload.date_iso.getTime()))
+            return res.status(400).json({ error: 'Invalid timeline payload' });
+        const item = await TimelineItem.findByIdAndUpdate(req.params.id, payload, { new: true });
+        if (!item)
+            return res.status(404).json({ error: 'Timeline item not found' });
+        return res.json(item);
+    }
+    catch (error) {
+        console.error('timeline update error', error);
+        return res.status(500).json({ error: 'Failed to update timeline item' });
+    }
+});
+app.delete('/api/timeline/:id', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const item = await TimelineItem.findByIdAndDelete(req.params.id);
+        if (!item)
+            return res.status(404).json({ error: 'Timeline item not found' });
+        return res.json({ deleted: true });
+    }
+    catch (error) {
+        console.error('timeline delete error', error);
+        return res.status(500).json({ error: 'Failed to delete timeline item' });
+    }
+});
+app.get('/api/blog/posts', async (req, res) => {
+    try {
+        const category = String(req.query?.category || '').trim();
+        const tag = String(req.query?.tag || '').trim();
+        const page = Math.max(1, parseInt(String(req.query?.page || '1'), 10) || 1);
+        const limit = Math.min(20, Math.max(1, parseInt(String(req.query?.limit || '10'), 10) || 10));
+        const filter = { status: 'published' };
+        if (category)
+            filter.category = category;
+        if (tag)
+            filter.tags = tag;
+        const [posts, total] = await Promise.all([
+            BlogPost.find(filter).sort({ publishedAt: -1, createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+            BlogPost.countDocuments(filter),
+        ]);
+        return res.json({
+            posts: posts.map((post) => ({
+                id: String(post._id),
+                title: post.title,
+                slug: post.slug,
+                excerpt: post.excerpt,
+                content: post.content,
+                coverImageUrl: post.coverImageUrl,
+                category: post.category,
+                tags: post.tags,
+                status: post.status,
+                authorName: post.authorName,
+                publishedAt: post.publishedAt,
+                createdAt: post.createdAt,
+                updatedAt: post.updatedAt,
+                viewCount: post.viewCount,
+            })),
+            pagination: {
+                page,
+                limit,
+                total,
+                pages: Math.ceil(total / limit),
+            },
+        });
+    }
+    catch (error) {
+        console.error('blog posts list error', error);
+        return res.status(500).json({ error: 'Failed to fetch blog posts' });
+    }
+});
+app.get('/api/blog/posts/:slug', async (req, res) => {
+    try {
+        const post = await BlogPost.findOneAndUpdate({ slug: req.params.slug, status: 'published' }, { $inc: { viewCount: 1 } }, { new: true }).lean();
+        if (!post)
+            return res.status(404).json({ error: 'Blog post not found' });
+        return res.json({
+            post: {
+                id: String(post._id),
+                title: post.title,
+                slug: post.slug,
+                excerpt: post.excerpt,
+                content: post.content,
+                coverImageUrl: post.coverImageUrl,
+                category: post.category,
+                tags: post.tags,
+                status: post.status,
+                authorName: post.authorName,
+                publishedAt: post.publishedAt,
+                createdAt: post.createdAt,
+                updatedAt: post.updatedAt,
+                viewCount: post.viewCount,
+            },
+        });
+    }
+    catch (error) {
+        console.error('blog post fetch error', error);
+        return res.status(500).json({ error: 'Failed to fetch blog post' });
+    }
+});
+app.get('/api/blog/categories', async (_req, res) => {
+    try {
+        const categories = await BlogPost.distinct('category', { status: 'published' });
+        return res.json({ categories: categories.filter(Boolean).sort() });
+    }
+    catch (error) {
+        console.error('blog categories error', error);
+        return res.status(500).json({ error: 'Failed to fetch blog categories' });
+    }
+});
+app.get('/api/admin/blog/posts', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const posts = await BlogPost.find({}).sort({ createdAt: -1 }).lean();
+        return res.json({
+            posts: posts.map((post) => ({
+                id: String(post._id),
+                title: post.title,
+                slug: post.slug,
+                excerpt: post.excerpt,
+                content: post.content,
+                coverImageUrl: post.coverImageUrl,
+                category: post.category,
+                tags: post.tags,
+                status: post.status,
+                authorId: String(post.authorId),
+                authorName: post.authorName,
+                publishedAt: post.publishedAt,
+                createdAt: post.createdAt,
+                updatedAt: post.updatedAt,
+                viewCount: post.viewCount,
+            })),
+        });
+    }
+    catch (error) {
+        console.error('admin blog list error', error);
+        return res.status(500).json({ error: 'Failed to fetch blog posts' });
+    }
+});
+app.post('/api/admin/blog/posts', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const admin = await User.findById(auth.userId);
+        if (!admin)
+            return res.status(404).json({ error: 'Admin user not found' });
+        const title = String(req.body?.title || '').trim();
+        const slugInput = String(req.body?.slug || title).trim();
+        const content = String(req.body?.content || '').trim();
+        if (!title || !content)
+            return res.status(400).json({ error: 'title and content are required' });
+        const slug = await ensureUniqueBlogSlug(slugInput);
+        const post = await BlogPost.create({
+            title,
+            slug,
+            excerpt: String(req.body?.excerpt || '').trim(),
+            content,
+            coverImageUrl: String(req.body?.coverImageUrl || '').trim(),
+            category: String(req.body?.category || '').trim(),
+            tags: Array.isArray(req.body?.tags) ? req.body.tags.map((tag) => String(tag).trim()).filter(Boolean) : [],
+            status: String(req.body?.status || 'draft') === 'published' ? 'published' : 'draft',
+            authorId: admin._id,
+            authorName: admin.name,
+            publishedAt: String(req.body?.status || 'draft') === 'published' ? new Date() : null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        });
+        return res.status(201).json({ post });
+    }
+    catch (error) {
+        console.error('admin blog create error', error);
+        return res.status(500).json({ error: 'Failed to create blog post' });
+    }
+});
+app.patch('/api/admin/blog/posts/:id', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const updates = { updatedAt: new Date() };
+        const fieldKeys = ['title', 'excerpt', 'content', 'coverImageUrl', 'category', 'status'];
+        for (const fieldKey of fieldKeys) {
+            if (fieldKey in req.body)
+                updates[fieldKey] = String(req.body[fieldKey] ?? '').trim();
+        }
+        if ('tags' in req.body) {
+            updates.tags = Array.isArray(req.body.tags) ? req.body.tags.map((tag) => String(tag).trim()).filter(Boolean) : [];
+        }
+        if ('slug' in req.body || 'title' in req.body) {
+            updates.slug = await ensureUniqueBlogSlug(String(req.body?.slug || req.body?.title || '').trim(), req.params.id);
+        }
+        if (updates.status === 'published') {
+            updates.publishedAt = req.body?.publishedAt ? new Date(req.body.publishedAt) : new Date();
+        }
+        if (updates.status === 'draft') {
+            updates.publishedAt = null;
+        }
+        const post = await BlogPost.findByIdAndUpdate(req.params.id, updates, { new: true });
+        if (!post)
+            return res.status(404).json({ error: 'Blog post not found' });
+        return res.json({ post });
+    }
+    catch (error) {
+        console.error('admin blog update error', error);
+        return res.status(500).json({ error: 'Failed to update blog post' });
+    }
+});
+app.delete('/api/admin/blog/posts/:id', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const deleted = await BlogPost.findByIdAndDelete(req.params.id);
+        if (!deleted)
+            return res.status(404).json({ error: 'Blog post not found' });
+        await Promise.all([
+            BlogComment.deleteMany({ postId: req.params.id }),
+            BlogLike.deleteMany({ postId: req.params.id }),
+        ]);
+        return res.json({ deleted: true });
+    }
+    catch (error) {
+        console.error('admin blog delete error', error);
+        return res.status(500).json({ error: 'Failed to delete blog post' });
+    }
+});
+app.patch('/api/admin/blog/posts/:id/publish', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const post = await BlogPost.findByIdAndUpdate(req.params.id, { status: 'published', publishedAt: new Date(), updatedAt: new Date() }, { new: true });
+        if (!post)
+            return res.status(404).json({ error: 'Blog post not found' });
+        return res.json({ post });
+    }
+    catch (error) {
+        console.error('admin blog publish error', error);
+        return res.status(500).json({ error: 'Failed to publish blog post' });
+    }
+});
+app.patch('/api/admin/blog/posts/:id/unpublish', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const post = await BlogPost.findByIdAndUpdate(req.params.id, { status: 'draft', updatedAt: new Date() }, { new: true });
+        if (!post)
+            return res.status(404).json({ error: 'Blog post not found' });
+        return res.json({ post });
+    }
+    catch (error) {
+        console.error('admin blog unpublish error', error);
+        return res.status(500).json({ error: 'Failed to unpublish blog post' });
+    }
+});
 app.post('/api/blog/:postId/like', async (req, res) => {
     try {
         const { postId } = req.params;
-        const { userId } = req.body;
-        if (!userId)
-            return res.status(401).json({ error: 'User ID required' });
-        const existingLike = await BlogLike.findOne({ postId, userId });
+        const browserUuid = String(req.body?.browserUuid || '').trim();
+        if (!browserUuid)
+            return res.status(400).json({ error: 'browserUuid is required' });
+        const existingLike = await BlogLike.findOne({ postId, browserUuid });
         if (existingLike)
             return res.status(409).json({ error: 'Already liked' });
-        await BlogLike.create({ postId, userId });
+        await BlogLike.create({ postId, browserUuid });
         const likeCount = await BlogLike.countDocuments({ postId });
-        res.json({ liked: true, likeCount });
+        return res.json({ liked: true, likeCount });
     }
     catch (error) {
-        console.error('Like error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('blog like error', error);
+        return res.status(500).json({ error: 'Internal server error' });
     }
 });
 app.delete('/api/blog/:postId/like', async (req, res) => {
     try {
         const { postId } = req.params;
-        const { userId } = req.body;
-        if (!userId)
-            return res.status(401).json({ error: 'User ID required' });
-        const result = await BlogLike.deleteOne({ postId, userId });
+        const browserUuid = String(req.body?.browserUuid || '').trim();
+        if (!browserUuid)
+            return res.status(400).json({ error: 'browserUuid is required' });
+        const result = await BlogLike.deleteOne({ postId, browserUuid });
         if (result.deletedCount === 0)
             return res.status(404).json({ error: 'Like not found' });
         const likeCount = await BlogLike.countDocuments({ postId });
-        res.json({ liked: false, likeCount });
+        return res.json({ liked: false, likeCount });
     }
     catch (error) {
-        console.error('Unlike error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('blog unlike error', error);
+        return res.status(500).json({ error: 'Internal server error' });
     }
 });
 app.get('/api/blog/:postId/likes', async (req, res) => {
     try {
         const { postId } = req.params;
-        const { userId } = req.query;
+        const browserUuid = String(req.query?.browserUuid || '').trim();
         const likeCount = await BlogLike.countDocuments({ postId });
-        const isLiked = userId ? Boolean(await BlogLike.exists({ postId, userId: userId })) : false;
-        res.json({ likeCount, isLiked });
+        const isLiked = browserUuid ? Boolean(await BlogLike.exists({ postId, browserUuid })) : false;
+        return res.json({ likeCount, isLiked });
     }
     catch (error) {
-        console.error('Get likes error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('blog likes fetch error', error);
+        return res.status(500).json({ error: 'Internal server error' });
     }
 });
 app.get('/api/blog/:postId/comments', async (req, res) => {
     try {
         const { postId } = req.params;
-        const page = parseInt(req.query.page || '1');
-        const limit = Math.min(parseInt(req.query.limit || '10'), 50);
+        const page = parseInt(req.query.page || '1', 10);
+        const limit = Math.min(parseInt(req.query.limit || '10', 10), 50);
         const skip = (page - 1) * limit;
-        const comments = await BlogComment.find({ postId, parentId: null }).sort({ created_at: -1 }).skip(skip).limit(limit).lean();
+        const comments = await BlogComment.find({ postId, parentId: null, status: 'approved' }).sort({ created_at: -1 }).skip(skip).limit(limit).lean();
         const commentsWithReplies = await Promise.all(comments.map(async (comment) => {
-            const replies = await BlogComment.find({ parentId: comment._id.toString() }).sort({ created_at: 1 }).lean();
-            return { ...comment, replies, replyCount: replies.length };
+            const replies = await BlogComment.find({ parentId: comment._id.toString(), status: 'approved' }).sort({ created_at: 1 }).lean();
+            return {
+                ...comment,
+                guestEmail: undefined,
+                replies: replies.map((reply) => ({ ...reply, guestEmail: undefined })),
+                replyCount: replies.length,
+            };
         }));
-        const totalComments = await BlogComment.countDocuments({ postId, parentId: null });
-        res.json({ comments: commentsWithReplies, pagination: { page, limit, total: totalComments, pages: Math.ceil(totalComments / limit) } });
+        const totalComments = await BlogComment.countDocuments({ postId, parentId: null, status: 'approved' });
+        return res.json({
+            comments: commentsWithReplies,
+            pagination: { page, limit, total: totalComments, pages: Math.ceil(totalComments / limit) },
+        });
     }
     catch (error) {
-        console.error('Get comments error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('blog comments fetch error', error);
+        return res.status(500).json({ error: 'Internal server error' });
     }
 });
-app.post('/api/blog/:postId/comments', async (req, res) => {
+app.post('/api/blog/:postId/comments', blogCommentLimiter, async (req, res) => {
     try {
         const { postId } = req.params;
-        const { userId, author, content, parentId } = req.body;
-        if (!userId || !author || !content)
-            return res.status(400).json({ error: 'User ID, author, and content are required' });
+        const website = String(req.body?.website || '').trim();
+        if (website)
+            return res.status(201).json({ success: true });
+        const content = String(req.body?.content || '').trim();
+        if (!content)
+            return res.status(400).json({ error: 'Comment content is required' });
         if (content.length > 1000)
             return res.status(400).json({ error: 'Comment too long (max 1000 characters)' });
-        const comment = await BlogComment.create({ postId, userId, author, content, parentId: parentId || null });
-        res.status(201).json(comment);
+        const userId = String(req.body?.userId || '').trim();
+        if (userId) {
+            const user = await User.findById(userId);
+            if (user) {
+                const comment = await BlogComment.create({
+                    postId,
+                    userId,
+                    author: validator.escape(String(req.body?.author || user.name)),
+                    content,
+                    parentId: req.body?.parentId ? String(req.body.parentId) : null,
+                    status: 'approved',
+                });
+                return res.status(201).json(comment);
+            }
+        }
+        const guestName = String(req.body?.guestName || '').trim();
+        const browserUuid = String(req.body?.browserUuid || '').trim();
+        if (!guestName || !browserUuid)
+            return res.status(400).json({ error: 'guestName and browserUuid are required' });
+        const comment = await BlogComment.create({
+            postId,
+            userId: browserUuid,
+            author: validator.escape(guestName),
+            guestEmail: String(req.body?.guestEmail || '').trim(),
+            content,
+            parentId: req.body?.parentId ? String(req.body.parentId) : null,
+            browserUuid,
+            status: 'pending',
+        });
+        return res.status(201).json(comment);
     }
     catch (error) {
-        console.error('Add comment error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('blog comment create error', error);
+        return res.status(500).json({ error: 'Internal server error' });
     }
 });
 app.put('/api/blog/comments/:commentId', async (req, res) => {
@@ -1296,16 +2009,16 @@ app.put('/api/blog/comments/:commentId', async (req, res) => {
         const { userId, content } = req.body;
         if (!userId || !content)
             return res.status(400).json({ error: 'User ID and content are required' });
-        if (content.length > 1000)
+        if (String(content).length > 1000)
             return res.status(400).json({ error: 'Comment too long (max 1000 characters)' });
-        const comment = await BlogComment.findOneAndUpdate({ _id: commentId, userId }, { content, updated_at: new Date() }, { new: true });
+        const comment = await BlogComment.findOneAndUpdate({ _id: commentId, userId }, { content: String(content), updated_at: new Date() }, { new: true });
         if (!comment)
             return res.status(404).json({ error: 'Comment not found or not authorized' });
-        res.json(comment);
+        return res.json(comment);
     }
     catch (error) {
-        console.error('Update comment error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('blog comment update error', error);
+        return res.status(500).json({ error: 'Internal server error' });
     }
 });
 app.delete('/api/blog/comments/:commentId', async (req, res) => {
@@ -1318,11 +2031,67 @@ app.delete('/api/blog/comments/:commentId', async (req, res) => {
         if (!comment)
             return res.status(404).json({ error: 'Comment not found or not authorized' });
         await BlogComment.deleteMany({ $or: [{ _id: commentId }, { parentId: commentId }] });
-        res.json({ deleted: true });
+        return res.json({ deleted: true });
     }
     catch (error) {
-        console.error('Delete comment error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('blog comment delete error', error);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+app.get('/api/admin/blog/comments', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const postId = String(req.query?.postId || '').trim();
+        const filter = { status: 'pending' };
+        if (postId)
+            filter.postId = postId;
+        const comments = await BlogComment.find(filter).sort({ created_at: -1 }).lean();
+        const posts = await BlogPost.find({ _id: { $in: comments.map((comment) => comment.postId) } }).select('_id title slug').lean();
+        const postMap = new Map(posts.map((post) => [String(post._id), post]));
+        return res.json({
+            comments: comments.map((comment) => ({
+                ...comment,
+                guestEmail: undefined,
+                postTitle: postMap.get(String(comment.postId))?.title || '',
+                postSlug: postMap.get(String(comment.postId))?.slug || '',
+            })),
+        });
+    }
+    catch (error) {
+        console.error('admin pending comments error', error);
+        return res.status(500).json({ error: 'Failed to fetch pending comments' });
+    }
+});
+app.patch('/api/admin/blog/comments/:id/approve', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const updated = await BlogComment.findByIdAndUpdate(req.params.id, { status: 'approved' }, { new: true });
+        if (!updated)
+            return res.status(404).json({ error: 'Comment not found' });
+        return res.json({ success: true });
+    }
+    catch (error) {
+        console.error('comment approve error', error);
+        return res.status(500).json({ error: 'Failed to approve comment' });
+    }
+});
+app.patch('/api/admin/blog/comments/:id/reject', async (req, res) => {
+    try {
+        const auth = await requireAdmin(req, res);
+        if (!auth)
+            return;
+        const updated = await BlogComment.findByIdAndUpdate(req.params.id, { status: 'rejected' }, { new: true });
+        if (!updated)
+            return res.status(404).json({ error: 'Comment not found' });
+        return res.json({ success: true });
+    }
+    catch (error) {
+        console.error('comment reject error', error);
+        return res.status(500).json({ error: 'Failed to reject comment' });
     }
 });
 async function start() {
@@ -1338,6 +2107,7 @@ async function start() {
             await mongoose.connect(uri);
             console.log('Connected to MongoDB');
             await ensureDecisionConfig();
+            await seedEmailTemplates();
         }
         app.listen(PORT, () => {
             console.log(`KC backend listening on http://localhost:${PORT}`);
